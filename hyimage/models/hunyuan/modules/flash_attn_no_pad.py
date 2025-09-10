@@ -26,8 +26,8 @@ def create_attention_mask(cu_seqlens: torch.Tensor, max_s: int, causal: bool = F
     mask = torch.zeros(batch_size, max_s, max_s, dtype=torch.bool, device=device)
     
     for i in range(batch_size):
-        start_idx = cu_seqlens[2 * i]
-        end_idx = cu_seqlens[2 * i + 1]
+        start_idx = cu_seqlens[2 * i].item()
+        end_idx = cu_seqlens[2 * i + 1].item()
         seq_len = end_idx - start_idx
         
         mask[i, :seq_len, :seq_len] = True
