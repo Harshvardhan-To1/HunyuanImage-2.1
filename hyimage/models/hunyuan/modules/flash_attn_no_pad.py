@@ -1,34 +1,13 @@
 import torch
+import torch.nn.functional as F
 from einops import rearrange
-
-try:
-    from flash_attn_interface import flash_attn_varlen_func
-
-    print("Using FlashAttention v3.")
-except ImportError:
-    print("FlashAttention v3 not found, falling back to v2.")
-    from flash_attn import flash_attn_varlen_func
-
-from flash_attn import flash_attn_varlen_qkvpacked_func
-from flash_attn.bert_padding import pad_input, unpad_input
 
 
 def get_cu_seqlens(text_mask: torch.Tensor, img_len: int):
-    """
-    Compute cumulative sequence lengths (cu_seqlens) for FlashAttention.
-
-    Args:
-        text_mask (torch.Tensor): Boolean mask of shape (batch_size, text_seq_len).
-        img_len (int): Length of image sequence.
-
-    Returns:
-        cu_seqlens (torch.Tensor): 1D tensor of cumulative sequence lengths for each segment.
-        max_len (int): Maximum sequence length (text + image).
-    """
     batch_size = text_mask.shape[0]
     text_len = text_mask.sum(dim=1)
     max_len = text_mask.shape[1] + img_len
-
+    
     cu_seqlens = torch.zeros([2 * batch_size + 1], dtype=torch.int32, device=text_mask.device)
     for i in range(batch_size):
         s = text_len[i] + img_len
@@ -36,11 +15,31 @@ def get_cu_seqlens(text_mask: torch.Tensor, img_len: int):
         s2 = (i + 1) * max_len
         cu_seqlens[2 * i + 1] = s1
         cu_seqlens[2 * i + 2] = s2
-
+    
     return cu_seqlens, max_len
 
 
-def flash_attn_v3(
+def create_attention_mask(cu_seqlens: torch.Tensor, max_s: int, causal: bool = False):
+    batch_size = (len(cu_seqlens) - 1) // 2
+    device = cu_seqlens.device
+    
+    mask = torch.zeros(batch_size, max_s, max_s, dtype=torch.bool, device=device)
+    
+    for i in range(batch_size):
+        start_idx = cu_seqlens[2 * i]
+        end_idx = cu_seqlens[2 * i + 1]
+        seq_len = end_idx - start_idx
+        
+        mask[i, :seq_len, :seq_len] = True
+        
+        if causal:
+            causal_mask = torch.tril(torch.ones(seq_len, seq_len, dtype=torch.bool, device=device))
+            mask[i, :seq_len, :seq_len] = mask[i, :seq_len, :seq_len] & causal_mask
+    
+    return mask
+
+
+def torch_sdpa_v3(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -49,31 +48,27 @@ def flash_attn_v3(
     causal: bool = False,
     deterministic: bool = False,
 ):
-    """
-    FlashAttention v3 wrapper.
-
-    Args:
-        q, k, v (torch.Tensor): Query, key, value tensors of shape (batch, seq, nheads, head_dim).
-        cu_seqlens (torch.Tensor): Cumulative sequence lengths.
-        max_s (int): Maximum sequence length.
-        causal (bool): Whether to apply causal masking.
-        deterministic (bool): Deterministic computation.
-
-    Returns:
-        torch.Tensor: Output tensor of shape (batch, seq, nheads, head_dim).
-    """
-    batch_size, seqlen = q.shape[:2]
-    q = q.reshape(-1, *q.shape[2:])
-    k = k.reshape(-1, *k.shape[2:])
-    v = v.reshape(-1, *v.shape[2:])
-    output = flash_attn_varlen_func(
-        q, k, v, cu_seqlens, cu_seqlens, max_s, max_s, causal=causal, deterministic=deterministic
+    batch_size, seq_len, n_heads, head_dim = q.shape
+    
+    q = q.transpose(1, 2)
+    k = k.transpose(1, 2)
+    v = v.transpose(1, 2)
+    
+    attn_mask = create_attention_mask(cu_seqlens, max_s, causal)
+    attn_mask = attn_mask.unsqueeze(1).expand(-1, n_heads, -1, -1)
+    
+    output = F.scaled_dot_product_attention(
+        q, k, v,
+        attn_mask=attn_mask,
+        is_causal=False,
     )
-    output = output.view(batch_size, seqlen, *output.shape[-2:])
+    
+    output = output.transpose(1, 2)
+    
     return output
 
 
-def flash_attn_no_pad(
+def torch_sdpa_no_pad(
     qkv: torch.Tensor,
     key_padding_mask: torch.Tensor,
     causal: bool = False,
@@ -81,45 +76,39 @@ def flash_attn_no_pad(
     softmax_scale=None,
     deterministic: bool = False,
 ):
-    """
-    FlashAttention for packed QKV input without padding.
-
-    Args:
-        qkv (torch.Tensor): Input tensor of shape (batch, seq, 3, nheads, head_dim).
-        key_padding_mask (torch.Tensor): Boolean mask of shape (batch, seq).
-        causal (bool): Whether to apply causal masking.
-        dropout_p (float): Dropout probability.
-        softmax_scale (float, optional): Softmax scaling factor.
-        deterministic (bool): Deterministic computation.
-
-    Returns:
-        torch.Tensor: Output tensor of shape (batch, seq, nheads, head_dim).
-    """
-    batch_size, seqlen, _, nheads, head_dim = qkv.shape
-    x = rearrange(qkv, "b s three h d -> b s (three h d)")
-
-    # Unpad input for FlashAttention, drop `used_seqlens_in_batch` for version compatibility
-    x_unpad, indices, cu_seqlens, max_s = unpad_input(x, key_padding_mask)[:4]
-    x_unpad = rearrange(x_unpad, "nnz (three h d) -> nnz three h d", three=3, h=nheads)
-
-    output_unpad = flash_attn_varlen_qkvpacked_func(
-        x_unpad,
-        cu_seqlens,
-        max_s,
-        dropout_p,
-        softmax_scale=softmax_scale,
-        causal=causal,
-        deterministic=deterministic,
+    batch_size, seq_len, _, n_heads, head_dim = qkv.shape
+    
+    q, k, v = qkv.unbind(dim=2)
+    
+    q = q.transpose(1, 2)
+    k = k.transpose(1, 2)
+    v = v.transpose(1, 2)
+    
+    attn_mask = key_padding_mask.unsqueeze(1).unsqueeze(2)
+    attn_mask = attn_mask.expand(batch_size, 1, seq_len, seq_len)
+    
+    query_mask = key_padding_mask.unsqueeze(1).unsqueeze(-1)
+    attn_mask = attn_mask & query_mask.expand(batch_size, 1, seq_len, seq_len)
+    
+    if causal:
+        causal_mask = torch.tril(torch.ones(seq_len, seq_len, dtype=torch.bool, device=qkv.device))
+        causal_mask = causal_mask.unsqueeze(0).unsqueeze(0)
+        attn_mask = attn_mask & causal_mask
+    
+    attn_mask = attn_mask.expand(batch_size, n_heads, seq_len, seq_len)
+    
+    output = F.scaled_dot_product_attention(
+        q, k, v,
+        attn_mask=attn_mask,
+        dropout_p=dropout_p if q.training else 0.0,
+        scale=softmax_scale,
+        is_causal=False,
     )
-    if isinstance(output_unpad, tuple):
-        output_unpad = output_unpad[0]
-
-    # Pad output back to original shape
-    output = pad_input(
-        rearrange(output_unpad, "nnz h d -> nnz (h d)"),
-        indices,
-        batch_size,
-        seqlen,
-    )
-    output = rearrange(output, "b s (h d) -> b s h d", h=nheads)
+    
+    output = output.transpose(1, 2)
+    
     return output
+
+
+flash_attn_v3 = torch_sdpa_v3
+flash_attn_no_pad = torch_sdpa_no_pad
