@@ -6,16 +6,23 @@ def get_cu_seqlens(text_mask: torch.Tensor, img_len: int):
     batch_size = text_mask.shape[0]
     text_len = text_mask.sum(dim=1)
     max_len = text_mask.shape[1] + img_len
+
+    # Vectorized computation for s and the indices
+    s = text_len + img_len
     
-    cu_seqlens_list = [0]
-    for i in range(batch_size):
-        s = (text_len[i] + img_len).item()
-        s1 = i * max_len + s
-        s2 = (i + 1) * max_len
-        cu_seqlens_list.extend([s1, s2])
+    # Create the base indices for the tensor operations
+    batch_indices = torch.arange(batch_size, device=text_mask.device)
     
-    cu_seqlens = torch.tensor(cu_seqlens_list, dtype=torch.int32, device=text_mask.device)
+    # Calculate s1 and s2 for all batches at once
+    s1 = batch_indices * max_len + s
+    s2 = (batch_indices + 1) * max_len
     
+    # Interleave s1 and s2
+    interleaved = torch.stack([s1, s2], dim=1).flatten()
+    
+    # Prepend the initial 0
+    cu_seqlens = torch.cat([torch.tensor([0], dtype=torch.int32, device=text_mask.device), interleaved])
+
     return cu_seqlens, max_len
 
 def create_attention_mask(cu_seqlens: torch.Tensor, max_s: int, causal: bool = False):
