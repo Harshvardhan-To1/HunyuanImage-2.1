@@ -2,22 +2,21 @@ import torch
 import torch.nn.functional as F
 from einops import rearrange
 
-
 def get_cu_seqlens(text_mask: torch.Tensor, img_len: int):
     batch_size = text_mask.shape[0]
     text_len = text_mask.sum(dim=1)
     max_len = text_mask.shape[1] + img_len
     
-    cu_seqlens = torch.zeros([2 * batch_size + 1], dtype=torch.int32, device=text_mask.device)
+    cu_seqlens_list = [0]
     for i in range(batch_size):
-        s = text_len[i] + img_len
+        s = (text_len[i] + img_len).item()
         s1 = i * max_len + s
         s2 = (i + 1) * max_len
-        cu_seqlens[2 * i + 1] = s1
-        cu_seqlens[2 * i + 2] = s2
+        cu_seqlens_list.extend([s1, s2])
+    
+    cu_seqlens = torch.tensor(cu_seqlens_list, dtype=torch.int32, device=text_mask.device)
     
     return cu_seqlens, max_len
-
 
 def create_attention_mask(cu_seqlens: torch.Tensor, max_s: int, causal: bool = False):
     batch_size = (len(cu_seqlens) - 1) // 2
@@ -25,19 +24,20 @@ def create_attention_mask(cu_seqlens: torch.Tensor, max_s: int, causal: bool = F
     
     mask = torch.zeros(batch_size, max_s, max_s, dtype=torch.bool, device=device)
     
+    if causal:
+        base_causal_mask = torch.tril(torch.ones(max_s, max_s, dtype=torch.bool, device=device))
+    
     for i in range(batch_size):
         start_idx = cu_seqlens[2 * i].item()
         end_idx = cu_seqlens[2 * i + 1].item()
         seq_len = end_idx - start_idx
         
-        mask[i, :seq_len, :seq_len] = True
-        
         if causal:
-            causal_mask = torch.tril(torch.ones(seq_len, seq_len, dtype=torch.bool, device=device))
-            mask[i, :seq_len, :seq_len] = mask[i, :seq_len, :seq_len] & causal_mask
+            mask[i, :seq_len, :seq_len] = base_causal_mask[:seq_len, :seq_len].clone()
+        else:
+            mask[i, :seq_len, :seq_len] = True
     
     return mask
-
 
 def torch_sdpa_v3(
     q: torch.Tensor,
@@ -50,12 +50,15 @@ def torch_sdpa_v3(
 ):
     batch_size, seq_len, n_heads, head_dim = q.shape
     
-    q = q.transpose(1, 2)
-    k = k.transpose(1, 2)
-    v = v.transpose(1, 2)
+    q = q.transpose(1, 2).contiguous()
+    k = k.transpose(1, 2).contiguous()
+    v = v.transpose(1, 2).contiguous()
     
     attn_mask = create_attention_mask(cu_seqlens, max_s, causal)
-    attn_mask = attn_mask.unsqueeze(1).expand(-1, n_heads, -1, -1)
+    attn_mask = attn_mask.unsqueeze(1).repeat(1, n_heads, 1, 1)
+    
+    with torch.no_grad():
+        attn_mask = attn_mask.clone()
     
     output = F.scaled_dot_product_attention(
         q, k, v,
@@ -63,10 +66,9 @@ def torch_sdpa_v3(
         is_causal=False,
     )
     
-    output = output.transpose(1, 2)
+    output = output.transpose(1, 2).contiguous()
     
     return output
-
 
 def torch_sdpa_no_pad(
     qkv: torch.Tensor,
@@ -80,25 +82,29 @@ def torch_sdpa_no_pad(
     
     q, k, v = qkv.unbind(dim=2)
     
-    q = q.transpose(1, 2)
-    k = k.transpose(1, 2)
-    v = v.transpose(1, 2)
+    q = q.transpose(1, 2).contiguous()
+    k = k.transpose(1, 2).contiguous()
+    v = v.transpose(1, 2).contiguous()
     
-    # Ensure key_padding_mask is boolean
     key_padding_mask = key_padding_mask.bool()
     
-    attn_mask = key_padding_mask.unsqueeze(1).unsqueeze(2)
-    attn_mask = attn_mask.expand(batch_size, 1, seq_len, seq_len)
+    attn_mask = key_padding_mask.unsqueeze(1).unsqueeze(2).clone()
+    attn_mask = attn_mask.repeat(1, 1, seq_len, 1)
     
-    query_mask = key_padding_mask.unsqueeze(1).unsqueeze(-1)
-    attn_mask = attn_mask & query_mask.expand(batch_size, 1, seq_len, seq_len)
+    query_mask = key_padding_mask.unsqueeze(1).unsqueeze(-1).clone()
+    query_mask = query_mask.repeat(1, 1, 1, seq_len)
+    
+    attn_mask = torch.logical_and(attn_mask, query_mask)
     
     if causal:
         causal_mask = torch.tril(torch.ones(seq_len, seq_len, dtype=torch.bool, device=qkv.device))
-        causal_mask = causal_mask.unsqueeze(0).unsqueeze(0)
-        attn_mask = attn_mask & causal_mask
+        causal_mask = causal_mask.unsqueeze(0).unsqueeze(0).repeat(batch_size, 1, 1, 1)
+        attn_mask = torch.logical_and(attn_mask, causal_mask)
     
-    attn_mask = attn_mask.expand(batch_size, n_heads, seq_len, seq_len)
+    attn_mask = attn_mask.repeat(1, n_heads, 1, 1)
+    
+    with torch.no_grad():
+        attn_mask = attn_mask.clone()
     
     output = F.scaled_dot_product_attention(
         q, k, v,
@@ -108,10 +114,19 @@ def torch_sdpa_no_pad(
         is_causal=False,
     )
     
-    output = output.transpose(1, 2)
+    output = output.transpose(1, 2).contiguous()
     
     return output
 
+def cleanup_attention_cache():
+    if hasattr(torch.backends.cuda, 'sdp_kernel'):
+        torch.backends.cuda.sdp_kernel(enable_flash=False)
+        torch.backends.cuda.sdp_kernel(enable_flash=True)
+    
+    import gc
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
 flash_attn_v3 = torch_sdpa_v3
 flash_attn_no_pad = torch_sdpa_no_pad
