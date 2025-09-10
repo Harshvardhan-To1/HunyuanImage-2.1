@@ -100,7 +100,7 @@ def torch_sdpa_no_pad(
     output = F.scaled_dot_product_attention(
         q, k, v,
         attn_mask=attn_mask,
-        dropout_p=dropout_p if q.training else 0.0,
+        dropout_p=dropout_p if torch.is_grad_enabled() else 0.0,
         scale=softmax_scale,
         is_causal=False,
     )
