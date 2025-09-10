@@ -95,12 +95,6 @@ def HUNYUANIMAGE_REFINER_DIT(**kwargs):
     )
 
 def HUNYUANIMAGE_REFINER_VAE_16x(**kwargs):
-    for file in os.listdir("./"):
-        print(f"file in current dir{file}")
-    for file in os.listdir(HUNYUANIMAGE_V2_1_MODEL_ROOT):
-        print(f"file in given dir{file}")
-    for file in os.listdir(f"{HUNYUANIMAGE_V2_1_MODEL_ROOT}/vae"):
-        print(f"file in vae dir{file}")
     return VAEConfig(
         model=L(load_refiner_vae)(
             vae_path=None,
