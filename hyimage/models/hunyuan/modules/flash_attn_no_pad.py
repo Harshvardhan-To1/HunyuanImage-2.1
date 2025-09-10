@@ -84,6 +84,9 @@ def torch_sdpa_no_pad(
     k = k.transpose(1, 2)
     v = v.transpose(1, 2)
     
+    # Ensure key_padding_mask is boolean
+    key_padding_mask = key_padding_mask.bool()
+    
     attn_mask = key_padding_mask.unsqueeze(1).unsqueeze(2)
     attn_mask = attn_mask.expand(batch_size, 1, seq_len, seq_len)
     
