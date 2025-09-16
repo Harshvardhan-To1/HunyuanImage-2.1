@@ -231,7 +231,7 @@ class HunyuanImagePipeline:
                 vae_config.model,
                 vae_path=vae_config.load_from,
             )
-            self.vae = self.vae.to(self.device)
+            self.vae = self.vae.to(self.device, dtype=self.torch_dtype)
             loguru.logger.info("✓ VAE loaded")
         except Exception as e:
             raise RuntimeError(f"Error loading VAE: {e}") from e
